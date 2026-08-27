@@ -181,7 +181,7 @@ custom_theme = gr.themes.Soft(
     neutral_hue="slate"
 )
 
-with gr.Blocks(title="OpenShorts AI Studio", theme=custom_theme) as app:
+with gr.Blocks(title="OpenShorts AI Studio") as app:
     gr.Markdown(
         """
         # ⚡ OpenShorts AI Studio
@@ -321,4 +321,4 @@ with gr.Blocks(title="OpenShorts AI Studio", theme=custom_theme) as app:
             )
 
 if __name__ == "__main__":
-    app.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
+    app.queue().launch(share=True, server_name="0.0.0.0", server_port=7860, theme=custom_theme)

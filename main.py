@@ -84,9 +84,16 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
 
 # --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# Support both mediapipe classic (<1.0) and safe fallback to YOLO if mediapipe 1.0+ changed APIs
+try:
+    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+        mp_face_detection = mp.solutions.face_detection
+        face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+    else:
+        # Fallback for mediapipe 1.0.0+
+        face_detection = None
+except Exception:
+    face_detection = None
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -429,6 +436,13 @@ def detect_face_candidates(frame):
     Boxes are in ORIGINAL frame coordinates (detection runs downscaled;
     MediaPipe's relative coords make the mapping exact).
     """
+    if face_detection is None:
+        # Fallback if mediapipe solution is unavailable
+        yolo_person = detect_person_yolo(frame)
+        if yolo_person:
+            return [{'box': yolo_person, 'score': yolo_person[2] * yolo_person[3]}]
+        return []
+
     height, width, _ = frame.shape
     small, _scale = _detection_frame(frame)
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -437,7 +451,7 @@ def detect_face_candidates(frame):
     
     candidates = []
     
-    if not results.detections:
+    if not results or not results.detections:
         return []
         
     for detection in results.detections:
