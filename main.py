@@ -736,21 +736,31 @@ def download_youtube_video(url, output_dir="."):
 
     cookies_path = '/app/cookies.txt'
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
+    if not cookies_env and os.path.exists('cookies.txt'):
         try:
-            with open(cookies_path, 'w') as f:
+            with open('cookies.txt', 'r', encoding='utf-8') as cf:
+                cookies_env = cf.read()
+        except Exception:
+            pass
+
+    if cookies_env:
+        print("🍪 Found YOUTUBE_COOKIES, creating cookies file...")
+        try:
+            target_cookie_path = '/app/cookies.txt' if os.path.exists('/app') else 'cookies_temp.txt'
+            with open(target_cookie_path, 'w', encoding='utf-8') as f:
                 f.write(cookies_env)
+            cookies_path = target_cookie_path
             if os.path.exists(cookies_path):
-                 # Never print file CONTENT here: with a headerless cookies
-                 # blob this would leak live YouTube session cookies to logs.
                  print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
     else:
-        cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        cookies_path = 'cookies.txt' if os.path.exists('cookies.txt') else None
+        if cookies_path:
+            print(f"🍪 Found local cookies.txt file ({os.path.getsize(cookies_path)} bytes).")
+        else:
+            print("⚠️ YOUTUBE_COOKIES env var not found.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
@@ -785,8 +795,7 @@ def download_youtube_video(url, output_dir="."):
         hd_args = None
     fallback_args = {
         'youtube': {
-            'player_client': ['tv_embed', 'android', 'mweb', 'web'],
-            'player_skip': ['webpage', 'configs'],
+            'player_client': ['android', 'ios', 'mweb', 'web_creator', 'web'],
         }
     }
 
