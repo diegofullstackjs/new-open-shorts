@@ -38,6 +38,8 @@ function createShortifyButton() {
     try {
       const formData = new FormData();
       formData.append("url", videoUrl);
+      formData.append("acknowledged", "true");
+      formData.append("force_low_quality", "true");
       formData.append("layouts", layout);
       formData.append("subtitle_style", subtitleStyle);
 
