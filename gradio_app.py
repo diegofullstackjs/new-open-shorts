@@ -12,6 +12,7 @@ import subprocess
 from datetime import datetime, timezone
 import gradio as gr
 import torch
+import cv2
 
 import channel_watcher
 import smart_scheduler
@@ -47,45 +48,59 @@ def process_video_pipeline(
 
     progress(0.05, desc="Iniciando processamento...")
     
-    # Import main pipeline
+    # Import core pipeline
     import main as os_main
+    from ffmpeg_utils import video_encode_args, audio_encode_args, QUALITY_FAST
 
     target_video_path = None
+    video_title = "video"
+
     if video_source_type == "YouTube URL":
         if not youtube_url or "http" not in youtube_url:
             raise gr.Error("URL do YouTube inválida!")
         progress(0.1, desc="Baixando vídeo do YouTube...")
-        target_video_path = os_main.download_youtube_video(youtube_url.strip())
+        dl_res = os_main.download_youtube_video(youtube_url.strip(), output_dir=OUTPUT_DIR)
+        if isinstance(dl_res, (tuple, list)):
+            target_video_path, video_title = dl_res[0], dl_res[1]
+        else:
+            target_video_path = dl_res
+            video_title = os.path.splitext(os.path.basename(target_video_path))[0]
     else:
         if not uploaded_file:
             raise gr.Error("Nenhum arquivo enviado!")
-        target_video_path = uploaded_file
+        target_video_path = uploaded_file.name if hasattr(uploaded_file, "name") else uploaded_file
+        video_title = os.path.splitext(os.path.basename(target_video_path))[0]
 
     if not target_video_path or not os.path.exists(target_video_path):
         raise gr.Error("Arquivo de vídeo não encontrado.")
 
+    # Apply layout mode setting
+    if layout_mode != "auto":
+        os.environ["AUTO_LAYOUT"] = "0"
+        if layout_mode == "split":
+            os.environ["SPLIT_LAYOUT"] = "1"
+        elif layout_mode == "screencast":
+            os.environ["SCREENCAST_LAYOUT"] = "1"
+    else:
+        os.environ["AUTO_LAYOUT"] = "1"
+
+    # Get duration
+    cap = cv2.VideoCapture(target_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    duration = frame_count / fps
+    cap.release()
+
     progress(0.25, desc="Transcrevendo áudio com Faster-Whisper...")
-    words_data = os_main.transcribe_audio(target_video_path)
-    
-    # Prepare transcript
-    full_transcript = " ".join([w.get("word", "") for w in words_data])
-    words_json_str = json.dumps([{"w": w["word"], "s": round(w["start"], 3), "e": round(w["end"], 3)} for w in words_data])
+    transcript = os_main.transcribe_video(target_video_path)
 
     progress(0.5, desc="Identificando momentos virais com Gemini AI...")
-    prompt = os_main.GEMINI_PROMPT_TEMPLATE.format(
-        video_duration=round(words_data[-1]["end"] if words_data else 60, 2),
-        transcript_text=full_transcript,
-        words_json=words_json_str
-    )
+    clips_data = os_main.get_viral_clips(transcript, duration)
     
-    # Call gemini
-    gemini_response = os_main.get_gemini_analysis(prompt)
-    
-    shorts_list = gemini_response.get("shorts", [])
+    shorts_list = clips_data.get("shorts", [])
     if not shorts_list:
         raise gr.Error("Nenhum clipe viral identificado pela IA para este vídeo.")
 
-    # Limit to target clips
     shorts_list = shorts_list[:int(target_clips_count)]
     
     output_clips = []
@@ -96,31 +111,55 @@ def process_video_pipeline(
         progress_val = 0.6 + (0.35 * (i / total_shorts))
         progress(progress_val, desc=f"Renderizando clipe {i+1} de {total_shorts} (9:16 Vertical)...")
 
-        start_time = float(short_data["start"])
-        end_time = float(short_data["end"])
-        clip_id = f"short_{int(time.time())}_{i+1}"
-        output_clip_path = os.path.join(OUTPUT_DIR, f"{clip_id}.mp4")
+        start = float(short_data["start"])
+        end = float(short_data["end"])
+        clip_filename = f"{video_title}_clip_{i+1}.mp4"
+        clip_temp_path = os.path.join(OUTPUT_DIR, f"temp_{clip_filename}")
+        clip_final_path = os.path.join(OUTPUT_DIR, clip_filename)
 
-        # Process clip with AI reframing
-        os_main.process_video_to_vertical(
-            input_video=target_video_path,
-            final_output_video=output_clip_path,
-            aspect_ratio=9/16
-        )
+        try:
+            # 1. Precise cut with FFmpeg
+            cut_cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start),
+                '-to', str(end),
+                '-i', target_video_path,
+                *video_encode_args(QUALITY_FAST),
+                *audio_encode_args(),
+                clip_temp_path
+            ]
+            subprocess.run(cut_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
-        if os.path.exists(output_clip_path):
-            output_clips.append(output_clip_path)
-            meta_text = (
-                f"### 🎬 Corte #{i+1}\n"
-                f"**Título Shorts:** {short_data.get('video_title_for_youtube_short', 'Short Viral')}\n\n"
-                f"**Hook Visual:** `{short_data.get('viral_hook_text', '')}`\n\n"
-                f"**Legenda TikTok:**\n{short_data.get('video_description_for_tiktok', '')}\n\n"
-                f"**Legenda Instagram:**\n{short_data.get('video_description_for_instagram', '')}\n"
-                f"---\n"
-            )
-            metadata_cards.append(meta_text)
+            # 2. Reframe to vertical (9:16)
+            os_main.render_clip(clip_temp_path, clip_final_path, output_format="vertical")
 
-    progress(1.0, desc="Concluído!")
+            # 3. Optional auto captions
+            deliver_path = clip_final_path
+            if subtitle_style != "none":
+                captioned = os_main.auto_caption_clip(deliver_path, transcript, start, end)
+                if captioned and os.path.exists(captioned):
+                    deliver_path = captioned
+
+            if os.path.exists(deliver_path):
+                output_clips.append(deliver_path)
+                meta_text = (
+                    f"### 🎬 Corte #{i+1}\n"
+                    f"**Título Shorts:** {short_data.get('video_title_for_youtube_short', 'Short Viral')}\n\n"
+                    f"**Hook Visual:** `{short_data.get('viral_hook_text', '')}`\n\n"
+                    f"**Legenda TikTok:**\n{short_data.get('video_description_for_tiktok', '')}\n\n"
+                    f"**Legenda Instagram:**\n{short_data.get('video_description_for_instagram', '')}\n"
+                    f"---\n"
+                )
+                metadata_cards.append(meta_text)
+
+        finally:
+            if os.path.exists(clip_temp_path):
+                try:
+                    os.remove(clip_temp_path)
+                except Exception:
+                    pass
+
+    progress(1.0, desc="Concluído com sucesso!")
     combined_meta = "\n\n".join(metadata_cards)
     return output_clips, combined_meta
 
