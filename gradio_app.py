@@ -1,6 +1,7 @@
 """
 OpenShorts Gradio WebUI Suite
 Complete GUI for Google Colab, Local & Remote GPU Execution.
+Includes 1-Click YouTube OAuth Authentication & Direct Shorts Publishing.
 """
 
 import os
@@ -16,9 +17,13 @@ import cv2
 
 import channel_watcher
 import smart_scheduler
+import youtube_publisher
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Global flow state for OAuth session
+oauth_flow_state = {}
 
 # ----------------- Helper Functions -----------------
 
@@ -39,6 +44,8 @@ def process_video_pipeline(
     min_clip_duration,
     max_clip_duration,
     gemini_key,
+    auto_publish_yt,
+    yt_privacy_status,
     progress=gr.Progress(track_tqdm=True)
 ):
     if gemini_key and len(gemini_key.strip()) > 5:
@@ -105,6 +112,8 @@ def process_video_pipeline(
     
     output_clips = []
     metadata_cards = []
+    yt_pub = youtube_publisher.YouTubePublisher()
+    can_publish_yt = auto_publish_yt and yt_pub.is_authenticated()
 
     total_shorts = len(shorts_list)
     for i, short_data in enumerate(shorts_list):
@@ -142,12 +151,29 @@ def process_video_pipeline(
 
             if os.path.exists(deliver_path):
                 output_clips.append(deliver_path)
+                
+                published_link_info = ""
+                # Auto-Publish to YouTube Shorts if enabled
+                if can_publish_yt:
+                    try:
+                        progress(progress_val + 0.05, desc=f"Publicando clipe {i+1} no YouTube Shorts...")
+                        pub_res = yt_pub.upload_short(
+                            video_path=deliver_path,
+                            title=short_data.get("video_title_for_youtube_short", f"Short Viral #{i+1}"),
+                            description=short_data.get("video_description_for_tiktok", ""),
+                            privacy_status=yt_privacy_status
+                        )
+                        published_link_info = f"\n\n🔴 **Publicado no YouTube Shorts:** [{pub_res['url']}]({pub_res['url']})"
+                    except Exception as yt_err:
+                        published_link_info = f"\n\n⚠️ **Falha no Upload do YouTube:** {yt_err}"
+
                 meta_text = (
                     f"### 🎬 Corte #{i+1}\n"
                     f"**Título Shorts:** {short_data.get('video_title_for_youtube_short', 'Short Viral')}\n\n"
                     f"**Hook Visual:** `{short_data.get('viral_hook_text', '')}`\n\n"
                     f"**Legenda TikTok:**\n{short_data.get('video_description_for_tiktok', '')}\n\n"
-                    f"**Legenda Instagram:**\n{short_data.get('video_description_for_instagram', '')}\n"
+                    f"**Legenda Instagram:**\n{short_data.get('video_description_for_instagram', '')}"
+                    f"{published_link_info}\n"
                     f"---\n"
                 )
                 metadata_cards.append(meta_text)
@@ -162,6 +188,56 @@ def process_video_pipeline(
     progress(1.0, desc="Concluído com sucesso!")
     combined_meta = "\n\n".join(metadata_cards)
     return output_clips, combined_meta
+
+
+# ----------------- YouTube OAuth Helpers -----------------
+
+def get_yt_auth_status():
+    yt_pub = youtube_publisher.YouTubePublisher()
+    if yt_pub.is_authenticated():
+        info = yt_pub.get_channel_info()
+        channel_name = info.get("title", "Canal Conectado") if info else "Canal Conectado"
+        return f"🟢 **YouTube Conectado:** {channel_name}"
+    return "🔴 **YouTube Desconectado.** Autentique abaixo para publicar seus Shorts automaticamente."
+
+def generate_youtube_oauth_link(client_id, client_secret):
+    global oauth_flow_state
+    if not client_id or not client_secret:
+        return "❌ Informe o Client ID e Client Secret do Google Cloud Console."
+    try:
+        yt_pub = youtube_publisher.YouTubePublisher()
+        auth_url, flow = yt_pub.get_auth_url(client_id.strip(), client_secret.strip())
+        oauth_flow_state["flow"] = flow
+        return f"👉 **[CLIQUE AQUI PARA AUTORIZAR COM O GOOGLE]({auth_url})**\n\n*Após autorizar na página do Google, copie o código exibido e cole no campo 'Código de Autorização' abaixo.*"
+    except Exception as e:
+        return f"❌ Erro ao gerar link OAuth: {e}"
+
+def complete_youtube_oauth(auth_code):
+    global oauth_flow_state
+    flow = oauth_flow_state.get("flow")
+    if not flow:
+        return "❌ Inicie o processo clicando no botão 'Gerar Link de Login' primeiro."
+    try:
+        yt_pub = youtube_publisher.YouTubePublisher()
+        success = yt_pub.exchange_code_for_token(flow, auth_code.strip())
+        if success:
+            info = yt_pub.get_channel_info()
+            channel_name = info.get("title", "Canal") if info else ""
+            return f"✅ **Autenticação concluída com sucesso no canal: {channel_name}!** Você já pode publicar Shorts."
+        else:
+            return "❌ Código de autorização inválido ou expirado."
+    except Exception as e:
+        return f"❌ Erro ao trocar código: {e}"
+
+def save_direct_yt_json(credentials_json_text):
+    if not credentials_json_text or len(credentials_json_text.strip()) < 10:
+        return "❌ JSON de credenciais vazio."
+    yt_pub = youtube_publisher.YouTubePublisher()
+    if yt_pub.save_credentials_from_json(credentials_json_text.strip()):
+        info = yt_pub.get_channel_info()
+        channel_name = info.get("title", "Canal") if info else ""
+        return f"✅ **Credenciais salvas com sucesso! Canal: {channel_name}**"
+    return "❌ JSON de credenciais inválido."
 
 
 # ----------------- Channel Watcher Helpers -----------------
@@ -224,7 +300,7 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
     gr.Markdown(
         """
         # ⚡ OpenShorts AI Studio
-        ### Transforme vídeos longos em Shorts, TikToks e Reels virais de alta retenção (9:16) com IA.
+        ### Transforme vídeos longos em Shorts, TikToks e Reels virais de alta retenção (9:16) com IA e publicação direta.
         """
     )
 
@@ -261,6 +337,10 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
                             min_dur = gr.Slider(15, 60, value=20, step=5, label="Duração Mínima (s)")
                             max_dur = gr.Slider(20, 120, value=60, step=5, label="Duração Máxima (s)")
 
+                    with gr.Accordion("🔴 Publicação Direta no YouTube Shorts", open=True):
+                        auto_publish_yt_check = gr.Checkbox(label="Publicar automaticamente no YouTube Shorts após gerar", value=False)
+                        yt_privacy_status_select = gr.Dropdown(["public", "unlisted", "private"], value="public", label="Visibilidade no YouTube")
+
                     gemini_api_key_input = gr.Textbox(
                         label="Gemini API Key (Google AI Studio)",
                         placeholder="Cole sua chave aqui ou deixe vazio se já configurado no Colab",
@@ -268,11 +348,11 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
                         value=os.environ.get("GEMINI_API_KEY", "")
                     )
 
-                    generate_btn = gr.Button("🚀 Gerar Shorts Virais com IA", variant="primary", size="lg")
+                    generate_btn = gr.Button("🚀 Gerar & Publicar Shorts com IA", variant="primary", size="lg")
 
                 with gr.Column(scale=1):
                     output_gallery = gr.Gallery(label="Shorts Verticais Gerados (9:16)", columns=2, height="auto")
-                    output_metadata = gr.Markdown(label="Títulos, Ganchos e Legendas Geradas")
+                    output_metadata = gr.Markdown(label="Títulos, Ganchos e Links de Publicação")
 
             generate_btn.click(
                 fn=process_video_pipeline,
@@ -285,12 +365,54 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
                     clips_count,
                     min_dur,
                     max_dur,
-                    gemini_api_key_input
+                    gemini_api_key_input,
+                    auto_publish_yt_check,
+                    yt_privacy_status_select
                 ],
                 outputs=[output_gallery, output_metadata]
             )
 
-        # --- TAB 2: AUTO-CHANNEL WATCHER ---
+        # --- TAB 2: AUTENTICAÇÃO YOUTUBE (1-CLICK OAUTH) ---
+        with gr.TabItem("🔑 Conectar Conta do YouTube"):
+            gr.Markdown("### 🔴 Autenticação Google/YouTube OAuth (1-Click Login)")
+            yt_status_box = gr.Markdown(get_yt_auth_status())
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### Opção 1: Login OAuth com seu Google Cloud Client")
+                    client_id_in = gr.Textbox(label="Google Client ID", placeholder="xxxx.apps.googleusercontent.com")
+                    client_secret_in = gr.Textbox(label="Google Client Secret", type="password", placeholder="GOCSPX-xxxx")
+                    gen_link_btn = gr.Button("🔗 Gerar Link de Autorização Google", variant="primary")
+                    oauth_link_display = gr.Markdown()
+
+                    auth_code_in = gr.Textbox(label="Código de Autorização", placeholder="Cole o código retornado pelo Google aqui...")
+                    complete_oauth_btn = gr.Button("✅ Conectar Canal do YouTube", variant="secondary")
+                    oauth_result_display = gr.Markdown()
+
+                with gr.Column():
+                    gr.Markdown("#### Opção 2: Importar Credenciais Diretas (JSON)")
+                    creds_json_in = gr.TextArea(label="Token JSON do YouTube", placeholder='{"token": "...", "refresh_token": "...", ...}', rows=8)
+                    save_json_btn = gr.Button("💾 Salvar Credenciais JSON")
+                    json_result_display = gr.Markdown()
+
+            gen_link_btn.click(
+                fn=generate_youtube_oauth_link,
+                inputs=[client_id_in, client_secret_in],
+                outputs=oauth_link_display
+            )
+            complete_oauth_btn.click(
+                fn=complete_youtube_oauth,
+                inputs=[auth_code_in],
+                outputs=oauth_result_display
+            ).then(fn=get_yt_auth_status, outputs=yt_status_box)
+
+            save_json_btn.click(
+                fn=save_direct_yt_json,
+                inputs=[creds_json_in],
+                outputs=json_result_display
+            ).then(fn=get_yt_auth_status, outputs=yt_status_box)
+
+        # --- TAB 3: AUTO-CHANNEL WATCHER ---
         with gr.TabItem("📺 Monitor de Canais (Auto Watcher)"):
             gr.Markdown("### 📡 Monitoramento Automático de Canais do YouTube")
             with gr.Row():
@@ -331,7 +453,7 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
                 outputs=[poll_status_msg, processed_dataframe]
             )
 
-        # --- TAB 3: SMART SCHEDULER ---
+        # --- TAB 4: SMART SCHEDULER ---
         with gr.TabItem("📅 Agendador Inteligente (Smart Scheduler)"):
             gr.Markdown("### ⏰ Fila de Publicação em Horários de Maior Engajamento")
             with gr.Row():
@@ -347,7 +469,7 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
             refresh_sched_btn.click(fn=get_scheduled_posts_table, outputs=scheduled_dataframe)
             dispatch_sched_btn.click(fn=dispatch_scheduled_now, outputs=[sched_status_label, scheduled_dataframe])
 
-        # --- TAB 4: CONFIGURAÇÕES & GPU ---
+        # --- TAB 5: CONFIGURAÇÕES & GPU ---
         with gr.TabItem("⚙️ Configurações & Status"):
             gr.Markdown("### 🖥️ Informações do Ambiente de Execução")
             gr.Textbox(label="Status da GPU / CUDA", value=get_gpu_status(), interactive=False)
@@ -355,6 +477,7 @@ with gr.Blocks(title="OpenShorts AI Studio") as app:
                 """
                 - **Faster-Whisper:** Acelerado por GPU (`float16` no Colab / CUDA).
                 - **MediaPipe / YOLOv8:** Rastreamento facial e reenquadramento cinematográfico ativo.
+                - **YouTube Data API v3:** Publicação direta de Shorts via OAuth 2.0.
                 - **FFmpeg:** Renderização e queima de legendas com suporte a CJK e fontes virais.
                 """
             )
